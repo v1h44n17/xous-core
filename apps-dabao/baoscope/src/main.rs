@@ -31,7 +31,7 @@ use bao1x_hal::bio::{Bio, CoreCsr};
 use usb_bao1x::{UsbDeviceState, UsbHid};
 use utralib::utra::bio_bdma;
 
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 7;
 /// BIO bit numbers sampled as channels 0..7. Bit n = PB(n) for n<16, PC(n-16) otherwise.
 /// These are all in dabao-console's ALLOWED_PINS list (free, not tied to board functions).
 const CH_BITS: [u32; 8] = [16, 17, 18, 19, 23, 24, 26, 27];
@@ -289,8 +289,67 @@ impl Scope {
         selftest: bool,
         timer: &ticktimer::Ticktimer,
     ) -> Result<(Vec<u32>, u32, bool), String> {
-        if !CH_BITS.contains(&pin) {
-            return Err(format!("pin {} is not one of the claimed channel bits {:?}", pin, CH_BITS));
+        let (words, actual, finished) = self.decode_run(
+            &[pin],
+            uart_rx_code().0,
+            baud * 8,
+            uart_tx_code().0,
+            baud,
+            nbytes,
+            timeout_ms,
+            selftest,
+            timer,
+        )?;
+        Ok((words, actual, finished))
+    }
+
+    /// On-chip I2C decode. cores[0] = decoder (state machine on SCL=bit `scl`, SDA=bit `scl`+1,
+    /// polled every quantum at `sample_hz`), cores[1] = writer, cores[2] = optional I2C master
+    /// test source running its bit phases at 4 x `bus_hz`.
+    /// Event word: tag<<16 | ack<<8 | data; tag 1 = START, 2 = STOP, 3 = BYTE (ack 0 = ACK).
+    fn decode_i2c(
+        &mut self,
+        sample_hz: u32,
+        bus_hz: u32,
+        scl: u32,
+        nevents: usize,
+        timeout_ms: u64,
+        selftest: bool,
+        timer: &ticktimer::Ticktimer,
+    ) -> Result<(Vec<u32>, u32, bool), String> {
+        if !CH_BITS.contains(&(scl + 1)) {
+            return Err(format!("SDA bit {} (SCL+1) is not a claimed channel bit {:?}", scl + 1, CH_BITS));
+        }
+        self.decode_run(
+            &[scl],
+            i2c_rx_code().0,
+            sample_hz,
+            i2c_tx_code().0,
+            bus_hz * 4,
+            nevents,
+            timeout_ms,
+            selftest,
+            timer,
+        )
+    }
+
+    /// Shared runner for on-chip decoders: decoder core -> FIFO2 -> writer core -> RAM, with an
+    /// optional test-source core. `pins` is placed at IMEM 0x400 of both decoder and source.
+    /// Returns (event words written, actual decoder quantum Hz, writer finished?).
+    fn decode_run(
+        &mut self,
+        pins: &[u32],
+        rx_code: &[u8],
+        rx_hz: u32,
+        tx_code: &[u8],
+        tx_hz: u32,
+        nbytes: usize,
+        timeout_ms: u64,
+        selftest: bool,
+        timer: &ticktimer::Ticktimer,
+    ) -> Result<(Vec<u32>, u32, bool), String> {
+        if let Some(p) = pins.iter().find(|p| !CH_BITS.contains(p)) {
+            return Err(format!("pin {} is not one of the claimed channel bits {:?}", p, CH_BITS));
         }
         let decoder = self.grant.cores[0];
         let writer = self.grant.cores[1];
@@ -302,8 +361,8 @@ impl Scope {
         let mut table = vec![pages as u32];
         table.extend_from_slice(&self.dma_pages[..pages]);
         let writer_image = with_table(writer_code().0, &table)?;
-        let decoder_image = with_table(uart_rx_code().0, &[pin])?;
-        let tx_image = with_table(uart_tx_code().0, &[pin])?;
+        let decoder_image = with_table(rx_code, pins)?;
+        let tx_image = with_table(tx_code, pins)?;
 
         let buf = self.dma_buf.as_mut().unwrap().as_mut_ptr() as *mut u32;
         for i in 0..words {
@@ -315,15 +374,13 @@ impl Scope {
         self.bio.init_core(writer, (&writer_image, None), free_run).map_err(|e| format!("init writer: {:?}", e))?;
         let actual = self
             .bio
-            .init_core(decoder, (&decoder_image, None), CoreConfig {
-                clock_mode: ClockMode::TargetFreqInt(baud * 8),
-            })
-            .map_err(|e| format!("init uart rx: {:?}", e))?
-            .unwrap_or(baud * 8);
+            .init_core(decoder, (&decoder_image, None), CoreConfig { clock_mode: ClockMode::TargetFreqInt(rx_hz) })
+            .map_err(|e| format!("init decoder: {:?}", e))?
+            .unwrap_or(rx_hz);
         if selftest {
             self.bio
-                .init_core(generator, (&tx_image, None), CoreConfig { clock_mode: ClockMode::TargetFreqInt(baud) })
-                .map_err(|e| format!("init uart tx: {:?}", e))?;
+                .init_core(generator, (&tx_image, None), CoreConfig { clock_mode: ClockMode::TargetFreqInt(tx_hz) })
+                .map_err(|e| format!("init test source: {:?}", e))?;
         } else {
             self.bio.init_core(generator, idle_code(), free_run).map_err(|e| format!("init idle: {:?}", e))?;
         }
@@ -539,6 +596,30 @@ fn main() -> ! {
                 let batches: u32 = batches.parse().unwrap_or(1000);
                 for _ in 0..batches {
                     tx.send_msg(&usb, b"STRM", &filler);
+                }
+            }
+            // i2c <sample_hz> <bus_hz> <scl_bit> <nevents> <timeout_ms> <selftest 0|1>  (SDA = scl_bit+1)
+            ["i2c", sample_hz, bus_hz, scl, n, timeout, selftest] => {
+                let sample_hz: u32 = sample_hz.parse().unwrap_or(10_000_000);
+                let bus_hz: u32 = bus_hz.parse().unwrap_or(100_000);
+                let scl: u32 = scl.parse().unwrap_or(16);
+                let n: usize = n.parse::<usize>().unwrap_or(1024).clamp(1, DMA_MAX_SAMPLES);
+                let timeout: u64 = timeout.parse().unwrap_or(1000);
+                let t0 = timer.elapsed_ms();
+                match scope.decode_i2c(sample_hz, bus_hz, scl, n, timeout, *selftest == "1", &timer) {
+                    Ok((words, actual, finished)) => {
+                        let elapsed = (timer.elapsed_ms() - t0) as u32;
+                        let mut hdr = [0u8; 20];
+                        for (i, v) in [PROTOCOL_VERSION, actual, words.len() as u32, elapsed, finished as u32]
+                            .iter()
+                            .enumerate()
+                        {
+                            hdr[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                        }
+                        let body: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        tx.send_parts(&usb, b"I2C1", &[&hdr, &body]);
+                    }
+                    Err(e) => tx.send_msg(&usb, b"ERR_", e.as_bytes()),
                 }
             }
             // uart <baud> <pin_bit> <nbytes> <timeout_ms> <selftest 0|1>
@@ -877,6 +958,148 @@ bio_code!(uart_tx_code, BSCP_UTX_START, BSCP_UTX_END,
     "addi a1, a1, 1",
     "andi a1, a1, 255",
     "j    20b"
+);
+
+// ---- On-chip I2C decode ----
+
+// I2C RX: polls the 2-bit line state s = SCL | SDA<<1 (SCL = BIO bit at IMEM 0x400, SDA = next
+// bit) every quantum and acts only on changes:
+//   SCL rising            -> shift SDA into the byte; after 9 bits emit BYTE (data, ack)
+//   SCL high, SDA falling -> START (also repeated START); resets the bit counter
+//   SCL high, SDA rising  -> STOP
+// Events -> FIFO2: tag<<16 | ack<<8 | data with tag 1 = START, 2 = STOP, 3 = BYTE.
+// Registers: a5 SCL bit, a2 previous state, a1 bit count, a0 shift register,
+// s0/s1/tp = START/STOP/BYTE tags, t0..t2 scratch (all within x1..x15).
+#[rustfmt::skip]
+bio_code!(i2c_rx_code, BSCP_IRX_START, BSCP_IRX_END,
+    "li   a3, 0x400",
+    "lw   a5, 0(a3)",
+    "lui  s0, 0x10",                    // 1 << 16 START
+    "lui  s1, 0x20",                    // 2 << 16 STOP
+    "lui  tp, 0x30",                    // 3 << 16 BYTE
+    "li   a2, 3",                       // bus idle: SCL and SDA high
+    "li   a1, 0",
+    "li   a0, 0",
+  "20:",
+    "mv   x20, x0",
+    "srl  t0, x21, a5",
+    "andi t0, t0, 3",
+    "beq  t0, a2, 20b",                 // no change
+    "xor  t1, t0, a2",                  // which lines changed
+    "andi t2, t0, 1",
+    "beqz t2, 29f",                     // SCL low now: nothing to decode, just track state
+    "andi t1, t1, 1",
+    "bnez t1, 25f",                     // SCL just rose: data bit
+    "andi t2, t0, 2",                   // SCL steady high, SDA changed
+    "bnez t2, 23f",
+    "mv   x18, s0",                     // SDA fell: START
+    "li   a1, 0",
+    "li   a0, 0",
+    "j    29f",
+  "23:",
+    "mv   x18, s1",                     // SDA rose: STOP
+    "li   a1, 0",
+    "li   a0, 0",
+    "j    29f",
+  "25:",
+    "srli t2, t0, 1",                   // SDA value
+    "slli a0, a0, 1",
+    "or   a0, a0, t2",
+    "addi a1, a1, 1",
+    "li   t1, 9",
+    "bne  a1, t1, 29f",
+    "srli t2, a0, 1",                   // data = first 8 bits (MSB first)
+    "andi t1, a0, 1",                   // ack = 9th bit
+    "slli t1, t1, 8",
+    "or   t2, t2, t1",
+    "or   x18, t2, tp",                 // BYTE event
+    "li   a1, 0",
+    "li   a0, 0",
+  "29:",
+    "mv   a2, t0",
+    "j    20b"
+);
+
+// I2C master test source (push-pull, same pins), quantum = 4 x bus rate, 4 quanta per bit.
+// Repeats: START, 0xA0 +ACK, k +ACK, ~k +NACK, STOP, idle; k = 0,1,2,...
+// Registers: a5 SCL bit, s0 SCL mask, s1 SDA mask, a3 k, a1 byte, a2 ack bit, a0 bit,
+// t2 bit counter, gp saved ra (nested call), t0/t1 scratch.
+#[rustfmt::skip]
+bio_code!(i2c_tx_code, BSCP_ITX_START, BSCP_ITX_END,
+    "li   a3, 0x400",
+    "lw   a5, 0(a3)",
+    "li   s0, 1",
+    "sll  s0, s0, a5",                  // SCL mask
+    "slli s1, s0, 1",                   // SDA mask
+    "or   t0, s0, s1",
+    "mv   x26, t0",
+    "mv   x24, t0",                     // both pins -> outputs
+    "mv   x21, t0",                     // idle: both high
+    "li   t2, 16",
+  "18:",
+    "mv   x20, x0",
+    "addi t2, t2, -1",
+    "bnez t2, 18b",
+    "li   a3, 0",
+  "20:",
+    "or   t0, s0, s1",                  // START: SDA falls while SCL high
+    "mv   x21, t0",
+    "mv   x20, x0",
+    "mv   x20, x0",
+    "mv   x21, s0",
+    "mv   x20, x0",
+    "mv   x20, x0",
+    "mv   x21, x0",                     // SCL low
+    "mv   x20, x0",
+    "li   a1, 0xA0",                    // address 0x50, write
+    "li   a2, 0",
+    "jal  ra, 61f",
+    "mv   a1, a3",                      // data k
+    "li   a2, 0",
+    "jal  ra, 61f",
+    "xori a1, a3, 255",                 // data ~k, NACK
+    "li   a2, 1",
+    "jal  ra, 61f",
+    "mv   x21, x0",                     // STOP: SDA rises while SCL high
+    "mv   x20, x0",
+    "mv   x21, s0",
+    "mv   x20, x0",
+    "mv   x20, x0",
+    "or   t0, s0, s1",
+    "mv   x21, t0",
+    "mv   x20, x0", "mv x20, x0", "mv x20, x0", "mv x20, x0",
+    "mv   x20, x0", "mv x20, x0", "mv x20, x0", "mv x20, x0",
+    "addi a3, a3, 1",
+    "andi a3, a3, 255",
+    "j    20b",
+  // send_bit(a0): SDA = a0 with SCL low, then SCL high for 2 quanta, then SCL low
+  "60:",
+    "sll  t0, a0, a5",
+    "slli t0, t0, 1",                   // a0 at the SDA bit
+    "mv   x21, t0",
+    "mv   x20, x0",
+    "mv   x20, x0",
+    "or   t1, t0, s0",
+    "mv   x21, t1",                     // SCL high: receiver samples here
+    "mv   x20, x0",
+    "mv   x20, x0",
+    "mv   x21, t0",                     // SCL low, SDA held
+    "ret",
+  // send_byte(a1 = byte MSB first, a2 = ack bit)
+  "61:",
+    "mv   gp, ra",
+    "li   t2, 8",
+  "62:",
+    "srli a0, a1, 7",
+    "andi a0, a0, 1",
+    "jal  ra, 60b",
+    "slli a1, a1, 1",
+    "addi t2, t2, -1",
+    "bnez t2, 62b",
+    "mv   a0, a2",
+    "jal  ra, 60b",
+    "mv   ra, gp",
+    "ret"
 );
 
 // Generator: 4-bit binary counter on BIO bits 16..19 (PC0..PC3), one count per quantum.
