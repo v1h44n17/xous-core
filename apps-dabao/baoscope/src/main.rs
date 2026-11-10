@@ -75,10 +75,17 @@ fn start_traffic(kind: RealTraffic, stop: Arc<AtomicBool>) -> std::thread::JoinH
     })
 }
 
-const PROTOCOL_VERSION: u32 = 9;
+const PROTOCOL_VERSION: u32 = 10;
 /// BIO bit numbers sampled as channels 0..7. Bit n = PB(n) for n<16, PC(n-16) otherwise.
 /// These are all in dabao-console's ALLOWED_PINS list (free, not tied to board functions).
 const CH_BITS: [u32; 8] = [16, 17, 18, 19, 23, 24, 26, 27];
+/// Pins the decoders may read in place WITHOUT claiming or remapping them: the chip's own
+/// UART2 TX (PB14 = BIO14) and I2C0 SCL/SDA (PB11/PB12 = BIO11/12). The hardware peripheral
+/// keeps driving the pad; BIO only observes it via x21 - wire-free sniffing of on-chip buses.
+const SNIFF_BITS: [u32; 3] = [11, 12, 14];
+
+fn decodable(bit: u32) -> bool { CH_BITS.contains(&bit) || SNIFF_BITS.contains(&bit) }
+
 const MAX_SAMPLES: usize = 65536;
 /// Spin-loop iterations to wait for a sample before declaring the BIO stuck.
 const STALL_SPINS: u32 = 20_000_000;
@@ -361,7 +368,7 @@ impl Scope {
         selftest: bool,
         timer: &ticktimer::Ticktimer,
     ) -> Result<(Vec<u32>, u32, bool), String> {
-        if !CH_BITS.contains(&(scl + 1)) {
+        if !decodable(scl + 1) {
             return Err(format!("SDA bit {} (SCL+1) is not a claimed channel bit {:?}", scl + 1, CH_BITS));
         }
         self.decode_run(
@@ -421,8 +428,13 @@ impl Scope {
         selftest: bool,
         timer: &ticktimer::Ticktimer,
     ) -> Result<(Vec<u32>, u32, bool), String> {
-        if let Some(p) = pins.iter().find(|p| !CH_BITS.contains(p)) {
+        if let Some(p) = pins.iter().find(|&&p| !decodable(p)) {
             return Err(format!("pin {} is not one of the claimed channel bits {:?}", p, CH_BITS));
+        }
+        // The test source drives its pins; never let it touch the chip's own peripheral pads.
+        let touches_sniff = pins.iter().any(|&p| SNIFF_BITS.contains(&p) || SNIFF_BITS.contains(&(p + 1)));
+        if selftest && touches_sniff {
+            return Err("self-test is not allowed on in-place sniff pins (PB11/PB12/PB14)".into());
         }
         let decoder = self.grant.cores[0];
         let writer = self.grant.cores[1];
