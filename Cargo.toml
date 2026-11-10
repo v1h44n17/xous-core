@@ -136,6 +136,7 @@ members = [
   "services/swaptest1",
   "services/swaptest2",
   "apps-dabao/bio-stream",
+  "apps-dabao/baoscope",
   "bao1x-boot/slh-dsa-bao1x",
   "primordial",
 ]

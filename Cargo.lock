@@ -617,6 +617,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "baoscope"
+version = "0.1.0"
+dependencies = [
+ "bao1x-api 0.1.4",
+ "bao1x-hal",
+ "bao1x-hal-service",
+ "crc32fast",
+ "log",
+ "usb-bao1x",
+ "utralib 0.1.27",
+ "xous 0.9.71 (registry+https://github.com/rust-lang/crates.io-index)",
+ "xous-api-log",
+ "xous-api-names",
+ "xous-api-ticktimer",
+]
+
+[[package]]
 name = "bare-metal"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
