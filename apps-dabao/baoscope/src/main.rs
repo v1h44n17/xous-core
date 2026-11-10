@@ -31,7 +31,7 @@ use bao1x_hal::bio::{Bio, CoreCsr};
 use usb_bao1x::{UsbDeviceState, UsbHid};
 use utralib::utra::bio_bdma;
 
-const PROTOCOL_VERSION: u32 = 7;
+const PROTOCOL_VERSION: u32 = 8;
 /// BIO bit numbers sampled as channels 0..7. Bit n = PB(n) for n<16, PC(n-16) otherwise.
 /// These are all in dabao-console's ALLOWED_PINS list (free, not tied to board functions).
 const CH_BITS: [u32; 8] = [16, 17, 18, 19, 23, 24, 26, 27];
@@ -333,6 +333,35 @@ impl Scope {
         )
     }
 
+    /// On-chip SPI decode (mode 0). Pins base..base+3 = SCK, MOSI, MISO, CS (default PC0..PC3).
+    /// Event word: tag<<16 | miso<<8 | mosi; tag 1 = CS assert, 2 = CS release (low bits =
+    /// leftover bit count), 3 = BYTE. Test source runs at 2 x `sck_hz` (one quantum per half-bit).
+    fn decode_spi(
+        &mut self,
+        sample_hz: u32,
+        sck_hz: u32,
+        base: u32,
+        nevents: usize,
+        timeout_ms: u64,
+        selftest: bool,
+        timer: &ticktimer::Ticktimer,
+    ) -> Result<(Vec<u32>, u32, bool), String> {
+        if let Some(b) = (base..base + 4).find(|b| !CH_BITS.contains(b)) {
+            return Err(format!("SPI pin bit {} (base+0..3) is not a claimed channel bit {:?}", b, CH_BITS));
+        }
+        self.decode_run(
+            &[base],
+            spi_rx_code().0,
+            sample_hz,
+            spi_tx_code().0,
+            sck_hz * 2,
+            nevents,
+            timeout_ms,
+            selftest,
+            timer,
+        )
+    }
+
     /// Shared runner for on-chip decoders: decoder core -> FIFO2 -> writer core -> RAM, with an
     /// optional test-source core. `pins` is placed at IMEM 0x400 of both decoder and source.
     /// Returns (event words written, actual decoder quantum Hz, writer finished?).
@@ -599,14 +628,21 @@ fn main() -> ! {
                 }
             }
             // i2c <sample_hz> <bus_hz> <scl_bit> <nevents> <timeout_ms> <selftest 0|1>  (SDA = scl_bit+1)
-            ["i2c", sample_hz, bus_hz, scl, n, timeout, selftest] => {
+            // spi <sample_hz> <sck_hz> <base_bit> <nevents> <timeout_ms> <selftest 0|1>  (SCK,MOSI,MISO,CS)
+            [proto @ ("i2c" | "spi"), sample_hz, bus_hz, pin, n, timeout, selftest] => {
                 let sample_hz: u32 = sample_hz.parse().unwrap_or(10_000_000);
                 let bus_hz: u32 = bus_hz.parse().unwrap_or(100_000);
-                let scl: u32 = scl.parse().unwrap_or(16);
+                let pin: u32 = pin.parse().unwrap_or(16);
                 let n: usize = n.parse::<usize>().unwrap_or(1024).clamp(1, DMA_MAX_SAMPLES);
                 let timeout: u64 = timeout.parse().unwrap_or(1000);
                 let t0 = timer.elapsed_ms();
-                match scope.decode_i2c(sample_hz, bus_hz, scl, n, timeout, *selftest == "1", &timer) {
+                let st = *selftest == "1";
+                let (kind, result) = if *proto == "spi" {
+                    (b"SPI1", scope.decode_spi(sample_hz, bus_hz, pin, n, timeout, st, &timer))
+                } else {
+                    (b"I2C1", scope.decode_i2c(sample_hz, bus_hz, pin, n, timeout, st, &timer))
+                };
+                match result {
                     Ok((words, actual, finished)) => {
                         let elapsed = (timer.elapsed_ms() - t0) as u32;
                         let mut hdr = [0u8; 20];
@@ -617,7 +653,7 @@ fn main() -> ! {
                             hdr[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
                         }
                         let body: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                        tx.send_parts(&usb, b"I2C1", &[&hdr, &body]);
+                        tx.send_parts(&usb, kind, &[&hdr, &body]);
                     }
                     Err(e) => tx.send_msg(&usb, b"ERR_", e.as_bytes()),
                 }
@@ -1099,6 +1135,142 @@ bio_code!(i2c_tx_code, BSCP_ITX_START, BSCP_ITX_END,
     "mv   a0, a2",
     "jal  ra, 60b",
     "mv   ra, gp",
+    "ret"
+);
+
+// ---- On-chip SPI decode (mode 0: CPOL=0, CPHA=0, MSB first) ----
+
+// SPI RX: polls the 4-bit state s = SCK | MOSI<<1 | MISO<<2 | CS<<3 (base BIO bit at IMEM
+// 0x400) every quantum and acts only on change:
+//   CS falls           -> ASSERT event, reset byte
+//   CS rises           -> RELEASE event (low bits = leftover bit count of a partial byte)
+//   SCK rises, CS low  -> shift MOSI and MISO in; after 8 bits emit BYTE
+// Events -> FIFO2: tag<<16 | miso<<8 | mosi, tag 1 = ASSERT, 2 = RELEASE, 3 = BYTE.
+// Registers: a5 base bit, a2 prev state, a3 bit count, a0 MOSI byte, a1 MISO byte, a4 = 8,
+// s0/s1/tp tags, t0..t2 scratch.
+#[rustfmt::skip]
+bio_code!(spi_rx_code, BSCP_SRX_START, BSCP_SRX_END,
+    "li   a3, 0x400",
+    "lw   a5, 0(a3)",
+    "lui  s0, 0x10",                    // ASSERT
+    "lui  s1, 0x20",                    // RELEASE
+    "lui  tp, 0x30",                    // BYTE
+    "li   a2, 8",                       // idle: CS high, SCK low
+    "li   a3, 0",
+    "li   a0, 0",
+    "li   a1, 0",
+    "li   a4, 8",
+  "20:",
+    "mv   x20, x0",
+    "srl  t0, x21, a5",
+    "andi t0, t0, 15",
+    "beq  t0, a2, 20b",
+    "xor  t1, t0, a2",
+    "andi t2, t1, 8",
+    "beqz t2, 24f",                     // CS unchanged
+    "andi t2, t0, 8",
+    "bnez t2, 22f",
+    "mv   x18, s0",                     // CS asserted
+    "j    23f",
+  "22:",
+    "or   x18, s1, a3",                 // CS released (+ leftover bits)
+  "23:",
+    "li   a3, 0",
+    "li   a0, 0",
+    "li   a1, 0",
+    "j    29f",
+  "24:",
+    "andi t2, t0, 8",
+    "bnez t2, 29f",                     // CS high: not our transaction
+    "andi t2, t1, 1",
+    "beqz t2, 29f",                     // SCK unchanged
+    "andi t2, t0, 1",
+    "beqz t2, 29f",                     // SCK fell
+    "srli t2, t0, 1",                   // SCK rose: sample MOSI
+    "andi t2, t2, 1",
+    "slli a0, a0, 1",
+    "or   a0, a0, t2",
+    "srli t2, t0, 2",                   // and MISO
+    "andi t2, t2, 1",
+    "slli a1, a1, 1",
+    "or   a1, a1, t2",
+    "addi a3, a3, 1",
+    "bne  a3, a4, 29f",
+    "slli t2, a1, 8",
+    "or   t2, t2, a0",
+    "or   x18, t2, tp",                 // BYTE event
+    "li   a3, 0",
+    "li   a0, 0",
+    "li   a1, 0",
+  "29:",
+    "mv   a2, t0",
+    "j    20b"
+);
+
+// SPI master test source (also plays the slave's MISO), push-pull on the same 4 pins,
+// quantum = 2 x SCK. Repeats: CS low, (MOSI/MISO) 9F/FF, k/~k, A5/k, CS high, idle.
+// Registers: a5 base bit, s0 4-pin mask, s1 SCK mask, gp CS mask, a3 k, a1/a2 MOSI/MISO byte,
+// t2 bit counter, t0/t1 scratch.
+#[rustfmt::skip]
+bio_code!(spi_tx_code, BSCP_STX_START, BSCP_STX_END,
+    "li   a3, 0x400",
+    "lw   a5, 0(a3)",
+    "li   s0, 15",
+    "sll  s0, s0, a5",
+    "li   s1, 1",
+    "sll  s1, s1, a5",                  // SCK
+    "li   gp, 8",
+    "sll  gp, gp, a5",                  // CS
+    "mv   x26, s0",
+    "mv   x24, s0",                     // all 4 pins -> outputs
+    "mv   x21, gp",                     // idle: CS high, SCK low
+    "li   t2, 16",
+  "18:",
+    "mv   x20, x0",
+    "addi t2, t2, -1",
+    "bnez t2, 18b",
+    "li   a3, 0",
+  "20:",
+    "mv   x21, x0",                     // CS low
+    "mv   x20, x0",
+    "li   a1, 0x9F",
+    "li   a2, 0xFF",
+    "jal  ra, 61f",
+    "mv   a1, a3",
+    "xori a2, a3, 255",
+    "jal  ra, 61f",
+    "li   a1, 0xA5",
+    "mv   a2, a3",
+    "jal  ra, 61f",
+    "mv   x20, x0",
+    "mv   x21, gp",                     // CS high
+    "mv   x20, x0",
+    "mv   x20, x0", "mv x20, x0", "mv x20, x0",
+    "addi a3, a3, 1",
+    "andi a3, a3, 255",
+    "j    20b",
+  // send_byte(a1 = MOSI, a2 = MISO), MSB first, mode 0: data set while SCK low, SCK high = sample
+  "61:",
+    "li   t2, 8",
+  "62:",
+    "srli t0, a1, 7",
+    "andi t0, t0, 1",
+    "slli t0, t0, 1",                   // MOSI -> bit 1
+    "srli t1, a2, 7",
+    "andi t1, t1, 1",
+    "slli t1, t1, 2",                   // MISO -> bit 2
+    "or   t0, t0, t1",                  // CS low, SCK low
+    "sll  t0, t0, a5",
+    "mv   x21, t0",
+    "mv   x20, x0",
+    "or   t1, t0, s1",
+    "mv   x21, t1",                     // SCK high
+    "mv   x20, x0",
+    "slli a1, a1, 1",
+    "slli a2, a2, 1",
+    "addi t2, t2, -1",
+    "bnez t2, 62b",
+    "mv   x21, t0",                     // SCK low, CS still low
     "ret"
 );
 
