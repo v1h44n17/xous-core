@@ -28,10 +28,54 @@ use bao1x_api::bio::*;
 use bao1x_api::bio_code;
 use bao1x_api::bio_resources::*;
 use bao1x_hal::bio::{Bio, CoreCsr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use usb_bao1x::{UsbDeviceState, UsbHid};
 use utralib::utra::bio_bdma;
 
-const PROTOCOL_VERSION: u32 = 8;
+/// Real (non-BIO) traffic sources for testing the decoders against actual chip peripherals.
+/// Each runs on its own thread until `stop` is set.
+enum RealTraffic {
+    /// Numbered log lines; the log server sends them out of UART2 TX (PB14, 1 Mbaud 8N1).
+    UartLog,
+    /// Repeated address scan 0x08..=0x77 on the hardware I2C0 controller (PB11 SCL, PB12 SDA).
+    I2cScan,
+}
+
+fn start_traffic(kind: RealTraffic, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<u32> {
+    std::thread::spawn(move || {
+        let mut count = 0u32;
+        match kind {
+            RealTraffic::UartLog => {
+                let t = ticktimer::Ticktimer::new().unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    log::info!("BSCP-REAL {:06}", count);
+                    count += 1;
+                    t.sleep_ms(1).ok();
+                }
+            }
+            RealTraffic::I2cScan => {
+                use bao1x_api::I2cApi;
+                let mut i2c = bao1x_hal::i2c::I2c::new();
+                let mut buf = [0u8; 1];
+                'outer: loop {
+                    for addr in 0x08u8..=0x77 {
+                        if stop.load(Ordering::Relaxed) {
+                            break 'outer;
+                        }
+                        // NACK or bus error are both fine here: we only need real bus activity.
+                        let _ = i2c.i2c_read(addr, 0x00, &mut buf, false);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    })
+}
+
+const PROTOCOL_VERSION: u32 = 9;
 /// BIO bit numbers sampled as channels 0..7. Bit n = PB(n) for n<16, PC(n-16) otherwise.
 /// These are all in dabao-console's ALLOWED_PINS list (free, not tied to board functions).
 const CH_BITS: [u32; 8] = [16, 17, 18, 19, 23, 24, 26, 27];
@@ -411,7 +455,11 @@ impl Scope {
                 .init_core(generator, (&tx_image, None), CoreConfig { clock_mode: ClockMode::TargetFreqInt(tx_hz) })
                 .map_err(|e| format!("init test source: {:?}", e))?;
         } else {
-            self.bio.init_core(generator, idle_code(), free_run).map_err(|e| format!("init idle: {:?}", e))?;
+            // Decoding an external signal: first force every BaoScope pin back to an input, so a
+            // pin left driven by an earlier self-test can never fight the external driver.
+            self.bio
+                .init_core(generator, inputs_code(), free_run)
+                .map_err(|e| format!("init pins-to-inputs: {:?}", e))?;
         }
         while self.fifo.csr.rf(bio_bdma::SFR_FLEVEL_PCLK_REGFIFO_LEVEL1) != 0 {
             let _ = self.fifo.csr.r(bio_bdma::SFR_RXF1);
@@ -636,12 +684,20 @@ fn main() -> ! {
                 let n: usize = n.parse::<usize>().unwrap_or(1024).clamp(1, DMA_MAX_SAMPLES);
                 let timeout: u64 = timeout.parse().unwrap_or(1000);
                 let t0 = timer.elapsed_ms();
+                // selftest: 0 = external signal, 1 = BIO test source, 2 = real I2C0 controller traffic
                 let st = *selftest == "1";
+                let stop = Arc::new(AtomicBool::new(false));
+                let traffic = (*selftest == "2" && *proto == "i2c")
+                    .then(|| start_traffic(RealTraffic::I2cScan, stop.clone()));
                 let (kind, result) = if *proto == "spi" {
                     (b"SPI1", scope.decode_spi(sample_hz, bus_hz, pin, n, timeout, st, &timer))
                 } else {
                     (b"I2C1", scope.decode_i2c(sample_hz, bus_hz, pin, n, timeout, st, &timer))
                 };
+                stop.store(true, Ordering::Relaxed);
+                if let Some(h) = traffic {
+                    log::info!("real I2C traffic: {} probes", h.join().unwrap_or(0));
+                }
                 match result {
                     Ok((words, actual, finished)) => {
                         let elapsed = (timer.elapsed_ms() - t0) as u32;
@@ -665,7 +721,15 @@ fn main() -> ! {
                 let nbytes: usize = nbytes.parse::<usize>().unwrap_or(1024).clamp(1, DMA_MAX_SAMPLES);
                 let timeout: u64 = timeout.parse().unwrap_or(1000);
                 let t0 = timer.elapsed_ms();
-                match scope.decode_uart(baud, pin, nbytes, timeout, *selftest == "1", &timer) {
+                // selftest: 0 = external signal, 1 = BIO test source, 2 = real UART2 log traffic
+                let stop = Arc::new(AtomicBool::new(false));
+                let traffic = (*selftest == "2").then(|| start_traffic(RealTraffic::UartLog, stop.clone()));
+                let result = scope.decode_uart(baud, pin, nbytes, timeout, *selftest == "1", &timer);
+                stop.store(true, Ordering::Relaxed);
+                if let Some(h) = traffic {
+                    let _ = h.join();
+                }
+                match result {
                     Ok((words, actual, finished)) => {
                         let elapsed = (timer.elapsed_ms() - t0) as u32;
                         let mut hdr = [0u8; 20];
@@ -834,6 +898,17 @@ bio_code!(dma_sampler8_code, BSCP_DMA8_START, BSCP_DMA8_END,
     "mv   x17, t1",
   "40:",
     "j    40b"
+);
+
+// Pins-to-inputs: releases every BaoScope channel pin (BIO bits 16-19, 23, 24, 26, 27 =
+// 0x0D8F_0000) to input, then idles. Used whenever an external device drives the pins.
+#[rustfmt::skip]
+bio_code!(inputs_code, BSCP_INP_START, BSCP_INP_END,
+    "lui  a0, 0x0d8f0",
+    "mv   x26, a0",
+    "mv   x25, a0",                     // (x26 & x25) -> 1 makes those pins inputs
+  "20:",
+    "j    20b"
 );
 
 // Idle: parks a granted core that this capture doesn't use.
